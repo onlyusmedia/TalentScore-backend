@@ -10,6 +10,15 @@ const { creditCheck } = require('./middleware/credit');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const isVercel = process.env.VERCEL === '1';
+
+// ─── For Serverless: Ensure DB is connected lazily ──────────────────
+if (isVercel) {
+  app.use(async (req, res, next) => {
+    await connectDB();
+    next();
+  });
+}
 
 // ─── Core Middleware ────────────────────────────────────────────────
 app.use(helmet());
@@ -59,35 +68,39 @@ app.use((err, req, res, next) => {
 const start = async () => {
   const dbConnected = await connectDB();
 
-  // Start BullMQ worker for async job processing
-  try {
-    const { testRedisConnection } = require('./config/redis');
-    const redisAvailable = await testRedisConnection();
-    if (redisAvailable) {
-      const { startWorker } = require('./workers/jobProcessor');
-      startWorker();
-    } else {
-      console.warn('[Server] Redis not available — BullMQ worker disabled');
-      console.warn('[Server] Async job processing will not work. Start Redis to enable it.');
+  // Start BullMQ worker for async job processing ONLY if NOT on Vercel
+  if (!isVercel) {
+    try {
+      const { testRedisConnection } = require('./config/redis');
+      const redisAvailable = await testRedisConnection();
+      if (redisAvailable) {
+        const { startWorker } = require('./workers/jobProcessor');
+        startWorker();
+      } else {
+        console.warn('[Server] Redis not available — BullMQ worker disabled');
+        console.warn('[Server] Async job processing will not work. Start Redis to enable it.');
+      }
+    } catch (err) {
+      console.warn('[Server] Worker failed to start:', err.message);
     }
-  } catch (err) {
-    console.warn('[Server] Worker failed to start:', err.message);
-  }
 
-  app.listen(PORT, () => {
-    console.log(`
-╔══════════════════════════════════════════════════════╗
-║    TalentScore API Server                            ║
-║    http://localhost:${PORT}                              ║
-║    Environment: ${(process.env.NODE_ENV || 'development').padEnd(12)}                    ║
-║    Database:    ${dbConnected ? 'Connected ✓ ' : 'Disconnected ✗'}                    ║
-╚══════════════════════════════════════════════════════╝
-    `);
-  });
+    app.listen(PORT, () => {
+      console.log(`
+  ╔══════════════════════════════════════════════════════╗
+  ║    TalentScore API Server                            ║
+  ║    http://localhost:${PORT}                              ║
+  ║    Environment: ${(process.env.NODE_ENV || 'development').padEnd(12)}                    ║
+  ║    Database:    ${dbConnected ? 'Connected ✓ ' : 'Disconnected ✗'}                    ║
+  ╚══════════════════════════════════════════════════════╝
+      `);
+    });
+  }
 };
 
-start().catch((err) => {
-  console.error('[Server] Failed to start:', err);
-});
+if (!isVercel) {
+  start().catch((err) => {
+    console.error('[Server] Failed to start:', err);
+  });
+}
 
 module.exports = app;
