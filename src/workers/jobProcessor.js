@@ -1,15 +1,126 @@
 const { Worker } = require('bullmq');
 const { getRedisConnection } = require('../config/redis');
 const Job = require('../models/Job');
+const Role = require('../models/Role');
+const Candidate = require('../models/Candidate');
 const { sendJobUpdate } = require('../services/sse');
+const { deductCredit } = require('../services/credit');
+const { generatePresignedDownloadUrl } = require('../config/s3');
 
 /**
  * BullMQ Worker
  * Processes queued jobs by calling n8n webhooks.
- * n8n handles the actual AI processing and calls back via internal API.
+ * The worker enriches queue data (generates S3 URLs, fetches DB records),
+ * sends it to n8n, and processes the AI response to update the database.
  */
 
 const N8N_BASE = process.env.N8N_WEBHOOK_BASE_URL || 'http://localhost:5678';
+
+/**
+ * Build the payload to send to n8n for each job type.
+ * This is where we enrich queue data with presigned URLs and DB records.
+ */
+const buildN8nPayload = async (type, data) => {
+  switch (type) {
+    case 'role-setup': {
+      // Role setup already has all needed data from the queue
+      return {
+        roleId: data.roleId,
+        jobDescription: data.jobDescription,
+        priorities: data.priorities,
+        payRange: data.payRange,
+      };
+    }
+
+    case 'resume-parse': {
+      // Generate a presigned S3 download URL for the resume
+      const resumeDownloadUrl = await generatePresignedDownloadUrl(data.s3Key);
+
+      // Fetch role for job description context
+      const role = await Role.findById(data.roleId).lean();
+
+      return {
+        candidateId: data.candidateId,
+        resumeDownloadUrl,
+        jobDescription: role?.originalJobDescription || role?.improvedJobDescription || '',
+        priorities: role?.priorities?.text || '',
+      };
+    }
+
+    case 'generate-questions': {
+      // Fetch role and candidates with parsed resumes
+      const role = await Role.findById(data.roleId).lean();
+      const candidates = await Candidate.find({
+        _id: { $in: data.candidateIds },
+        'resume.processingStatus': 'done',
+      }).lean();
+
+      return {
+        roleId: data.roleId,
+        jobDescription: role?.improvedJobDescription || role?.originalJobDescription || '',
+        priorities: role?.priorities?.text || '',
+        scoringCategories: role?.scoringCategories || [],
+        candidates: candidates.map((c) => ({
+          candidateId: c._id.toString(),
+          name: c.name || 'Unknown',
+          resumeSummary: c.resume?.summary || '',
+          strengths: c.resume?.strengths || [],
+          concerns: c.resume?.concerns || [],
+        })),
+      };
+    }
+
+    case 'score-candidates': {
+      // Fetch role and candidates with all available data
+      const role = await Role.findById(data.roleId).lean();
+      const candidates = await Candidate.find({
+        _id: { $in: data.candidateIds },
+        'resume.processingStatus': 'done',
+      }).lean();
+
+      return {
+        roleId: data.roleId,
+        jobDescription: role?.improvedJobDescription || role?.originalJobDescription || '',
+        priorities: role?.priorities?.text || '',
+        scoringCategories: role?.scoringCategories || [],
+        candidates: candidates.map((c) => ({
+          candidateId: c._id.toString(),
+          name: c.name || 'Unknown',
+          resumeSummary: c.resume?.summary || '',
+          strengths: c.resume?.strengths || [],
+          concerns: c.resume?.concerns || [],
+          interviewTranscript: c.interview?.transcriptRaw || null,
+          interviewStructured: c.interview?.transcriptStructured || [],
+        })),
+      };
+    }
+
+    case 'transcribe-interview': {
+      const payload = {
+        candidateId: data.candidateId,
+      };
+
+      if (data.transcript) {
+        // Text transcript — send directly
+        payload.transcript = data.transcript;
+
+        // Fetch planned interview questions for context
+        const candidate = await Candidate.findById(data.candidateId).lean();
+        payload.interviewQuestions = candidate?.interviewQuestions?.standard || [];
+      }
+
+      if (data.hasAudio && data.audioS3Key) {
+        // Audio file — generate presigned download URL
+        payload.audioDownloadUrl = await generatePresignedDownloadUrl(data.audioS3Key);
+      }
+
+      return payload;
+    }
+
+    default:
+      return data;
+  }
+};
 
 const processJob = async (bullJob) => {
   const { type, data } = { type: bullJob.name, data: bullJob.data };
@@ -38,28 +149,48 @@ const processJob = async (bullJob) => {
   }
 
   try {
-    // Call n8n webhook
-    const response = await fetch(`${N8N_BASE}${webhookPath}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Internal-Key': process.env.INTERNAL_API_KEY,
-      },
-      body: JSON.stringify({
-        ...data,
-        callbackBaseUrl: `http://localhost:${process.env.PORT || 4000}/api/internal`,
-      }),
-    });
+    // Build enriched payload for n8n (presigned URLs, DB data, etc.)
+    const payload = await buildN8nPayload(type, data);
+    console.log(`[Worker] Built payload for ${type}, sending to n8n...`);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`n8n webhook failed (${response.status}): ${errorText}`);
+    // Call n8n webhook — n8n processes AI and responds with results
+    console.log(`[Worker] Sending payload to n8n ${type}:`, JSON.stringify(payload, null, 2));
+    
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
+
+    try {
+      const response = await fetch(`${N8N_BASE}${webhookPath}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Internal-Key': process.env.INTERNAL_API_KEY,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`n8n webhook failed (${response.status}): ${errorText}`);
+      }
+
+      // Parse the AI results from n8n's response
+      const result = await response.json();
+      console.log(`[Worker] ${type} got results from n8n, updating database...`);
+
+      // Process the results based on job type
+      await handleResult(type, data, result);
+
+      console.log(`[Worker] ${type} completed successfully`);
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw new Error(`n8n webhook timed out after 60s for ${type}`);
+      }
+      throw error;
     }
-
-    console.log(`[Worker] ${type} dispatched to n8n successfully`);
-
-    // n8n will call back to /api/internal when done
-    // The job will be marked as complete by the callback
   } catch (error) {
     console.error(`[Worker] ${type} failed:`, error.message);
 
@@ -80,13 +211,134 @@ const processJob = async (bullJob) => {
 };
 
 /**
+ * Process n8n webhook response and update database
+ */
+const handleResult = async (type, data, result) => {
+  switch (type) {
+    case 'role-setup': {
+      const { roleId, improvedJobDescription, scoringCategories, marketFeedback } = result;
+
+      await Role.findByIdAndUpdate(roleId || data.roleId, {
+        $set: {
+          improvedJobDescription,
+          scoringCategories,
+          marketFeedback,
+          'processingStatus.jobPostImprovement': 'done',
+          'processingStatus.categoryGeneration': 'done',
+          status: 'active',
+        },
+      });
+
+      await Job.findByIdAndUpdate(data.jobId, { $set: { status: 'done', progress: 100 } });
+      sendJobUpdate(data.userId, data.jobId, 'done', 100, { type: 'role-setup', roleId: roleId || data.roleId });
+      console.log(`[Worker] Role setup complete: ${roleId || data.roleId}`);
+      break;
+    }
+
+    case 'resume-parse': {
+      const { candidateId, name, email, phone, summary, strengths, concerns, experience, skills } = result;
+
+      await Candidate.findByIdAndUpdate(candidateId || data.candidateId, {
+        $set: {
+          name: name || 'Unknown',
+          email: email || undefined,
+          'resume.summary': summary,
+          'resume.strengths': strengths || [],
+          'resume.concerns': concerns || [],
+          'resume.processingStatus': 'done',
+          'resume.processedAt': new Date(),
+        },
+      });
+
+      await Job.findByIdAndUpdate(data.jobId, { $set: { status: 'done', progress: 100 } });
+      sendJobUpdate(data.userId, data.jobId, 'done', 100, { type: 'resume-parsed', candidateId: candidateId || data.candidateId });
+      console.log(`[Worker] Resume parsed: ${candidateId || data.candidateId} → ${name}`);
+      break;
+    }
+
+    case 'generate-questions': {
+      const { candidateId, questions } = result;
+
+      await Candidate.findByIdAndUpdate(candidateId || data.candidateIds?.[0], {
+        $set: {
+          interviewQuestions: {
+            ...questions,
+            processingStatus: 'done',
+            generatedAt: new Date(),
+          },
+        },
+      });
+
+      await Job.findByIdAndUpdate(data.jobId, { $set: { status: 'done', progress: 100 } });
+      sendJobUpdate(data.userId, data.jobId, 'done', 100, { type: 'questions-generated' });
+      console.log(`[Worker] Questions generated for: ${candidateId || data.candidateIds?.[0]}`);
+      break;
+    }
+
+    case 'score-candidates': {
+      const { candidateId, roleId, scores } = result;
+      const cId = candidateId || data.candidateIds?.[0];
+
+      const candidate = await Candidate.findById(cId);
+
+      await Candidate.findByIdAndUpdate(cId, {
+        $set: {
+          'scores.categories': scores.categories,
+          'scores.overallScore': scores.overallScore,
+          'scores.label': scores.label,
+          'scores.executiveSummary': scores.executiveSummary,
+          'scores.topStrengths': scores.topStrengths || [],
+          'scores.topConcerns': scores.topConcerns || [],
+          'scores.pastProblemMatch': scores.pastProblemMatch || {},
+          'scores.interviewerFeedback': scores.interviewerFeedback || [],
+          'scores.processingStatus': 'done',
+          'scores.scoredAt': new Date(),
+        },
+      });
+
+      // Deduct credit on successful scoring
+      if (candidate && !candidate.creditDeducted) {
+        try {
+          await deductCredit(candidate.userId, candidate.roleId, candidate._id);
+          await Candidate.findByIdAndUpdate(cId, {
+            $set: { creditDeducted: true, creditDeductedAt: new Date() },
+          });
+        } catch (creditErr) {
+          console.warn(`[Worker] Credit deduction failed for ${cId}:`, creditErr.message);
+        }
+      }
+
+      await Job.findByIdAndUpdate(data.jobId, { $set: { status: 'done', progress: 100 } });
+      sendJobUpdate(data.userId, data.jobId, 'done', 100, { type: 'scoring-complete', candidateId: cId });
+      console.log(`[Worker] Scoring complete: ${cId} → ${scores.label} (${scores.overallScore})`);
+      break;
+    }
+
+    case 'transcribe-interview': {
+      const { candidateId, transcriptRaw, transcriptStructured } = result;
+
+      await Candidate.findByIdAndUpdate(candidateId || data.candidateId, {
+        $set: {
+          'interview.transcriptRaw': transcriptRaw,
+          'interview.transcriptStructured': transcriptStructured || [],
+          'interview.processingStatus': 'done',
+          'interview.processedAt': new Date(),
+        },
+      });
+
+      await Job.findByIdAndUpdate(data.jobId, { $set: { status: 'done', progress: 100 } });
+      sendJobUpdate(data.userId, data.jobId, 'done', 100, { type: 'interview-processed', candidateId: candidateId || data.candidateId });
+      console.log(`[Worker] Interview processed: ${candidateId || data.candidateId}`);
+      break;
+    }
+  }
+};
+
+/**
  * Demo mode: simulates AI processing when n8n is not available
  * This allows frontend development without the full AI stack
  */
 const simulateDemoProcessing = async (type, data) => {
-  const Role = require('../models/Role');
-  const Candidate = require('../models/Candidate');
-
   switch (type) {
     case 'role-setup': {
       await new Promise((r) => setTimeout(r, 2000));
