@@ -40,7 +40,22 @@ const getQueue = (name) => {
  * @returns {string} Job ID (BullMQ job ID or fake inline job ID)
  */
 const enqueueJob = async (type, data) => {
+  const isVercel = process.env.VERCEL === '1';
   const queue = getQueue('talentscore');
+
+  // On Vercel, we need to process jobs synchronously because there's no persistent worker
+  if (isVercel) {
+    console.log(`[Queue] Running on Vercel — processing ${type} synchronously`);
+    try {
+      const { processJobLogic } = require('../workers/jobProcessor');
+      // We AWAIT here to ensure n8n completes before the serverless function terminates
+      await processJobLogic(type, data);
+      return `vercel-${type}-${Date.now()}`;
+    } catch (err) {
+      console.error(`[Queue] Vercel synchronous processing failed for ${type}:`, err.message);
+      // Fall through to normal queueing/demo if needed, or just throw
+    }
+  }
 
   if (queue) {
     // Real BullMQ queue

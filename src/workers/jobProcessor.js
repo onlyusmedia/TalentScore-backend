@@ -122,17 +122,22 @@ const buildN8nPayload = async (type, data) => {
   }
 };
 
-const processJob = async (bullJob) => {
-  const { type, data } = { type: bullJob.name, data: bullJob.data };
-  console.log(`[Worker] Processing ${type}: ${bullJob.id}`);
+/**
+ * Core processing logic for a job.
+ * Separated from the BullMQ wrapper so it can be called synchronously on Vercel.
+ */
+const processJobLogic = async (type, data, internalId = null) => {
+  const logId = internalId || `inline-${Date.now()}`;
+  console.log(`[Processor] Processing ${type}: ${logId}`);
 
   // Update job status to processing
-  await Job.findByIdAndUpdate(data.jobId, {
-    $set: { status: 'processing', progress: 10 },
-  });
-
-  // Send SSE update
-  sendJobUpdate(data.userId, data.jobId, 'processing', 10);
+  if (data.jobId) {
+    await Job.findByIdAndUpdate(data.jobId, {
+      $set: { status: 'processing', progress: 10 },
+    });
+    // Send SSE update
+    sendJobUpdate(data.userId, data.jobId, 'processing', 10);
+  }
 
   // Map job types to n8n webhook paths
   const webhookMap = {
@@ -151,10 +156,10 @@ const processJob = async (bullJob) => {
   try {
     // Build enriched payload for n8n (presigned URLs, DB data, etc.)
     const payload = await buildN8nPayload(type, data);
-    console.log(`[Worker] Built payload for ${type}, sending to n8n...`);
+    console.log(`[Processor] Built payload for ${type}, sending to n8n...`);
 
     // Call n8n webhook — n8n processes AI and responds with results
-    console.log(`[Worker] Sending payload to n8n ${type}:`, JSON.stringify(payload, null, 2));
+    console.log(`[Processor] Sending payload to n8n ${type}:`, JSON.stringify(payload, null, 2));
     
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout
@@ -179,12 +184,12 @@ const processJob = async (bullJob) => {
 
       // Parse the AI results from n8n's response
       const result = await response.json();
-      console.log(`[Worker] ${type} got results from n8n, updating database...`);
+      console.log(`[Processor] ${type} got results from n8n, updating database...`);
 
       // Process the results based on job type
       await handleResult(type, data, result);
 
-      console.log(`[Worker] ${type} completed successfully`);
+      console.log(`[Processor] ${type} completed successfully`);
     } catch (error) {
       if (error.name === 'AbortError') {
         throw new Error(`n8n webhook timed out after 60s for ${type}`);
@@ -192,22 +197,29 @@ const processJob = async (bullJob) => {
       throw error;
     }
   } catch (error) {
-    console.error(`[Worker] ${type} failed:`, error.message);
+    console.error(`[Processor] ${type} failed:`, error.message);
 
     // If n8n is down, simulate processing for development
     if (error.message.includes('fetch failed') || error.message.includes('ECONNREFUSED')) {
-      console.log(`[Worker] n8n unavailable — running in demo mode for ${type}`);
+      console.log(`[Processor] n8n unavailable — running in demo mode for ${type}`);
       await simulateDemoProcessing(type, data);
       return;
     }
 
     // Update job status to failed
-    await Job.findByIdAndUpdate(data.jobId, {
-      $set: { status: 'failed', error: error.message },
-    });
-    sendJobUpdate(data.userId, data.jobId, 'failed', 0, { error: error.message });
+    if (data.jobId) {
+      await Job.findByIdAndUpdate(data.jobId, {
+        $set: { status: 'failed', error: error.message },
+      });
+      sendJobUpdate(data.userId, data.jobId, 'failed', 0, { error: error.message });
+    }
     throw error;
   }
+};
+
+const processJob = async (bullJob) => {
+  const { type, data } = { type: bullJob.name, data: bullJob.data };
+  return processJobLogic(type, data, bullJob.id);
 };
 
 /**
@@ -517,4 +529,4 @@ const startWorker = () => {
   return worker;
 };
 
-module.exports = { startWorker };
+module.exports = { startWorker, processJobLogic };
